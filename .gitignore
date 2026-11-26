@@ -1,0 +1,8 @@
+build/
+classes_stubs/
+classes_module/
+*.class
+keystore.jks
+unsigned.apk
+aligned.apk
+*.dex
