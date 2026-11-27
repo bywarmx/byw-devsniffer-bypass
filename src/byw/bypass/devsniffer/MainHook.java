@@ -53,8 +53,7 @@ public class MainHook implements IXposedHookLoadPackage {
             "com.joeykrim.rootcheck",
             "hk.kirk.trustme",
             "com.virb3.trustmealready",
-            "just.trust.me",
-            "com.evozi.injector"
+            "just.trust.me"
     ));
 
     private static final Set<String> ROOT_FILES = new HashSet<String>(Arrays.asList(
@@ -96,22 +95,24 @@ public class MainHook implements IXposedHookLoadPackage {
 
         Log.e(TAG, "Initializing Dev & Sniffer Bypass for: " + lpparam.packageName);
 
-        hookCrashSuppression();
+        hookCrashSuppression(lpparam.packageName);
         hookSettings(lpparam.classLoader);
-        hookPackageManager(lpparam.classLoader);
-        if (!"com.halcon.connect".equals(lpparam.packageName)) {
+        hookPackageManager(lpparam.packageName, lpparam.classLoader);
+        if (!"com.halcon.connect".equals(lpparam.packageName) && !"com.evozi.injector".equals(lpparam.packageName)) {
             hookNetworkCapabilities(lpparam.classLoader);
         }
-        hookRootFiles(lpparam.classLoader);
+        hookRootFiles(lpparam.packageName, lpparam.classLoader);
 
         if ("com.halcon.connect".equals(lpparam.packageName)) {
             hookHalconConnect(lpparam.classLoader);
+        } else if ("com.evozi.injector".equals(lpparam.packageName)) {
+            hookHttpInjector(lpparam.classLoader);
         } else if ("mx.com.cfe.cfecontigo".equals(lpparam.packageName)) {
             hookCfeContigo(lpparam.classLoader);
         }
     }
 
-    private void hookCrashSuppression() {
+    private void hookCrashSuppression(final String hostPackage) {
         try {
             wrapDefaultExceptionHandler();
 
@@ -145,8 +146,8 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                     int pid = ((Integer) param.args[0]).intValue();
-                    if (pid == Process.myPid() && sSuppressedCrashRecently) {
-                        Log.e(TAG, "Blocked Process.killProcess triggered by suppressed crash");
+                    if (pid == Process.myPid()) {
+                        Log.e(TAG, "Blocked self Process.killProcess in: " + hostPackage);
                         param.setResult(null);
                     }
                 }
@@ -155,8 +156,8 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(System.class, "exit", int.class, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    if (sSuppressedCrashRecently) {
-                        Log.e(TAG, "Blocked System.exit triggered by suppressed crash");
+                    if (sSuppressedCrashRecently || "com.halcon.connect".equals(hostPackage) || "com.evozi.injector".equals(hostPackage)) {
+                        Log.e(TAG, "Blocked System.exit in: " + hostPackage);
                         param.setResult(null);
                     }
                 }
@@ -267,7 +268,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private void hookPackageManager(ClassLoader classLoader) {
+    private void hookPackageManager(final String hostPackage, ClassLoader classLoader) {
         try {
             Class<?> pmClass = XposedHelpers.findClassIfExists("android.app.ApplicationPackageManager", classLoader);
             if (pmClass == null) return;
@@ -276,7 +277,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                     String pkg = (String) param.args[0];
-                    if (pkg != null && BLOCKED_PACKAGES.contains(pkg)) {
+                    if (pkg != null && !pkg.equals(hostPackage) && BLOCKED_PACKAGES.contains(pkg)) {
                         param.setThrowable(new PackageManager.NameNotFoundException(pkg));
                     }
                 }
@@ -297,6 +298,13 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedHelpers.findAndHookMethod(pmClass, "getApplicationInfo", String.class, int.class, pkgInfoHook);
             } catch (Throwable ignored) {}
 
+            try {
+                Class<?> appFlagsClass = XposedHelpers.findClassIfExists("android.content.pm.PackageManager$ApplicationInfoFlags", classLoader);
+                if (appFlagsClass != null) {
+                    XposedHelpers.findAndHookMethod(pmClass, "getApplicationInfo", String.class, appFlagsClass, pkgInfoHook);
+                }
+            } catch (Throwable ignored) {}
+
             XposedHelpers.findAndHookMethod(pmClass, "getInstalledPackages", int.class, new XC_MethodHook() {
                 @Override
                 @SuppressWarnings("unchecked")
@@ -305,7 +313,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (list != null) {
                         List<PackageInfo> filtered = new ArrayList<PackageInfo>();
                         for (PackageInfo pi : list) {
-                            if (pi != null && !BLOCKED_PACKAGES.contains(pi.packageName)) {
+                            if (pi != null && (pi.packageName.equals(hostPackage) || !BLOCKED_PACKAGES.contains(pi.packageName))) {
                                 filtered.add(pi);
                             }
                         }
@@ -322,7 +330,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (list != null) {
                         List<ApplicationInfo> filtered = new ArrayList<ApplicationInfo>();
                         for (ApplicationInfo ai : list) {
-                            if (ai != null && !BLOCKED_PACKAGES.contains(ai.packageName)) {
+                            if (ai != null && (ai.packageName.equals(hostPackage) || !BLOCKED_PACKAGES.contains(ai.packageName))) {
                                 filtered.add(ai);
                             }
                         }
@@ -342,18 +350,24 @@ public class MainHook implements IXposedHookLoadPackage {
                             if (list != null) {
                                 List<ActivityManager.RunningAppProcessInfo> filtered = new ArrayList<ActivityManager.RunningAppProcessInfo>();
                                 for (ActivityManager.RunningAppProcessInfo info : list) {
-                                    if (info != null && info.processName != null && !BLOCKED_PACKAGES.contains(info.processName)) {
-                                        boolean blocked = false;
-                                        if (info.pkgList != null) {
-                                            for (String p : info.pkgList) {
-                                                if (BLOCKED_PACKAGES.contains(p)) {
-                                                    blocked = true;
-                                                    break;
+                                    if (info != null && info.processName != null) {
+                                        if (info.processName.contains(hostPackage)) {
+                                            filtered.add(info);
+                                            continue;
+                                        }
+                                        if (!BLOCKED_PACKAGES.contains(info.processName)) {
+                                            boolean blocked = false;
+                                            if (info.pkgList != null) {
+                                                for (String p : info.pkgList) {
+                                                    if (!p.equals(hostPackage) && BLOCKED_PACKAGES.contains(p)) {
+                                                        blocked = true;
+                                                        break;
+                                                    }
                                                 }
                                             }
-                                        }
-                                        if (!blocked) {
-                                            filtered.add(info);
+                                            if (!blocked) {
+                                                filtered.add(info);
+                                            }
                                         }
                                     }
                                 }
@@ -372,8 +386,14 @@ public class MainHook implements IXposedHookLoadPackage {
                             if (list != null) {
                                 List<ActivityManager.RunningServiceInfo> filtered = new ArrayList<ActivityManager.RunningServiceInfo>();
                                 for (ActivityManager.RunningServiceInfo s : list) {
-                                    if (s != null && s.service != null && !BLOCKED_PACKAGES.contains(s.service.getPackageName()) && !BLOCKED_PACKAGES.contains(s.process)) {
-                                        filtered.add(s);
+                                    if (s != null && s.service != null) {
+                                        if (s.service.getPackageName().equals(hostPackage)) {
+                                            filtered.add(s);
+                                            continue;
+                                        }
+                                        if (!BLOCKED_PACKAGES.contains(s.service.getPackageName()) && !BLOCKED_PACKAGES.contains(s.process)) {
+                                            filtered.add(s);
+                                        }
                                     }
                                 }
                                 param.setResult(filtered);
@@ -419,7 +439,7 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
-    private void hookRootFiles(ClassLoader classLoader) {
+    private void hookRootFiles(final String hostPackage, ClassLoader classLoader) {
         try {
             XC_MethodHook fileHook = new XC_MethodHook() {
                 @Override
@@ -440,49 +460,51 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedHelpers.findAndHookMethod(File.class, "canRead", fileHook);
             } catch (Throwable ignored) {}
 
-            // Hook Runtime.exec and ProcessBuilder to block command-based root checks
-            XC_MethodHook execHook = new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    Object cmdObj = param.args[0];
-                    String cmd = "";
-                    if (cmdObj instanceof String) {
-                        cmd = (String) cmdObj;
-                    } else if (cmdObj instanceof String[]) {
-                        cmd = Arrays.toString((String[]) cmdObj);
-                    }
-                    if (cmd.contains("su") || cmd.contains("which") || cmd.contains("busybox")) {
-                        Log.e(TAG, "Blocked exec command: " + cmd);
-                        param.setThrowable(new IOException("Command not found: " + cmd));
-                    }
-                }
-            };
-
-            try {
-                XposedHelpers.findAndHookMethod(Runtime.class, "exec", String.class, execHook);
-                XposedHelpers.findAndHookMethod(Runtime.class, "exec", String[].class, execHook);
-                XposedHelpers.findAndHookMethod(Runtime.class, "exec", String.class, String[].class, File.class, execHook);
-                XposedHelpers.findAndHookMethod(Runtime.class, "exec", String[].class, String[].class, File.class, execHook);
-            } catch (Throwable ignored) {}
-
-            try {
-                XposedHelpers.findAndHookMethod(ProcessBuilder.class, "start", new XC_MethodHook() {
+            // Hook Runtime.exec and ProcessBuilder to block command-based root checks, unless host app is HTTP Injector
+            if (!"com.evozi.injector".equals(hostPackage)) {
+                XC_MethodHook execHook = new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                        ProcessBuilder pb = (ProcessBuilder) param.thisObject;
-                        List<String> command = pb.command();
-                        if (command != null) {
-                            for (String c : command) {
-                                if (c != null && (c.contains("su") || c.contains("which") || c.contains("busybox"))) {
-                                    Log.e(TAG, "Blocked ProcessBuilder command: " + command);
-                                    param.setThrowable(new IOException("Command not found: " + command));
-                                    return;
+                        Object cmdObj = param.args[0];
+                        String cmd = "";
+                        if (cmdObj instanceof String) {
+                            cmd = (String) cmdObj;
+                        } else if (cmdObj instanceof String[]) {
+                            cmd = Arrays.toString((String[]) cmdObj);
+                        }
+                        if (cmd.contains("su") || cmd.contains("which") || cmd.contains("busybox")) {
+                            Log.e(TAG, "Blocked exec command: " + cmd);
+                            param.setThrowable(new IOException("Command not found: " + cmd));
+                        }
+                    }
+                };
+
+                try {
+                    XposedHelpers.findAndHookMethod(Runtime.class, "exec", String.class, execHook);
+                    XposedHelpers.findAndHookMethod(Runtime.class, "exec", String[].class, execHook);
+                    XposedHelpers.findAndHookMethod(Runtime.class, "exec", String.class, String[].class, File.class, execHook);
+                    XposedHelpers.findAndHookMethod(Runtime.class, "exec", String[].class, String[].class, File.class, execHook);
+                } catch (Throwable ignored) {}
+
+                try {
+                    XposedHelpers.findAndHookMethod(ProcessBuilder.class, "start", new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                            ProcessBuilder pb = (ProcessBuilder) param.thisObject;
+                            List<String> command = pb.command();
+                            if (command != null) {
+                                for (String c : command) {
+                                    if (c != null && (c.contains("su") || c.contains("which") || c.contains("busybox"))) {
+                                        Log.e(TAG, "Blocked ProcessBuilder command: " + command);
+                                        param.setThrowable(new IOException("Command not found: " + command));
+                                        return;
+                                    }
                                 }
                             }
                         }
-                    }
-                });
-            } catch (Throwable ignored) {}
+                    });
+                } catch (Throwable ignored) {}
+            }
 
             try {
                 Field tagsField = android.os.Build.class.getDeclaredField("TAGS");
@@ -492,6 +514,14 @@ public class MainHook implements IXposedHookLoadPackage {
 
         } catch (Throwable t) {
             Log.e(TAG, "hookRootFiles error: " + t.getMessage());
+        }
+    }
+
+    private void hookHttpInjector(final ClassLoader classLoader) {
+        try {
+            Log.e(TAG, "Initialized HTTP Injector specific hooks");
+        } catch (Throwable t) {
+            Log.e(TAG, "hookHttpInjector error: " + t.getMessage());
         }
     }
 

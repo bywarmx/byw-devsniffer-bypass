@@ -2,5 +2,6 @@
 <resources>
     <string-array name="xposedscope">
         <item>com.halcon.connect</item>
+        <item>com.evozi.injector</item>
     </string-array>
 </resources>
