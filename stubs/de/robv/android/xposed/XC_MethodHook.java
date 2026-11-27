@@ -2,7 +2,7 @@ package de.robv.android.xposed;
 public abstract class XC_MethodHook {
     public XC_MethodHook() {}
     public XC_MethodHook(int priority) {}
-    public static class MethodHookParam {
+    public static class MethodHookParam { public java.lang.reflect.Member method;
         public Object thisObject;
         public Object[] args;
         public Object result;

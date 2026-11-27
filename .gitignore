@@ -6,3 +6,4 @@ keystore.jks
 unsigned.apk
 aligned.apk
 *.dex
+*.idsig

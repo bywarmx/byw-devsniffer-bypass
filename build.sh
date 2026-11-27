@@ -27,9 +27,10 @@ echo "[*] Empaquetando recursos..."
     -I "$ANDROID_JAR" \
     -F "$DIR/build/unsigned.apk"
 
+cp -r "$DIR/assets" "$DIR/build/"
 cd "$DIR/build"
 "$AAPT" add unsigned.apk classes.dex
-"$AAPT" add unsigned.apk "$DIR/assets/xposed_init"
+"$AAPT" add unsigned.apk assets/xposed_init
 
 echo "[*] Alineando..."
 "$ZIPALIGN" -p -f 4 "$DIR/build/unsigned.apk" "$DIR/build/aligned.apk"

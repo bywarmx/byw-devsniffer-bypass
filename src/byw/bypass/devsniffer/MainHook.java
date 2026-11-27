@@ -1,15 +1,20 @@
 package byw.bypass.devsniffer;
 
+import android.app.ActivityManager;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.net.NetworkCapabilities;
+import android.os.Process;
 import android.provider.Settings;
+import android.util.Log;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -25,9 +30,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
 
+    private static final String TAG = "bywZero";
+
     private static final Set<String> BLOCKED_PACKAGES = new HashSet<String>(Arrays.asList(
             "com.emanuelef.remote_capture",
             "com.pcapdroid.mitm",
+            "com.byw.pwardroid",
+            "com.byw.netmanager",
             "app.greyshirts.sslcapture",
             "com.guoshi.httpcanary",
             "com.guoshi.httpcanary.premium",
@@ -41,6 +50,7 @@ public class MainHook implements IXposedHookLoadPackage {
             "me.weishu.kernelsu",
             "com.topjohnwu.magisk",
             "ru.dxqlyhmv.eyyuacuyb",
+            "com.joeykrim.rootcheck",
             "hk.kirk.trustme",
             "com.virb3.trustmealready",
             "just.trust.me",
@@ -71,8 +81,12 @@ public class MainHook implements IXposedHookLoadPackage {
             "/data/adb/ksud",
             "/data/adb/magisk",
             "/data/adb/modules",
-            "/proc/modules"
+            "/proc/modules",
+            "/system/bin/which",
+            "/system/xbin/which"
     ));
+
+    private static volatile boolean sSuppressedCrashRecently = false;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -80,12 +94,14 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        XposedBridge.log("[bywZero] Initializing Dev & Sniffer Bypass for: " + lpparam.packageName);
+        Log.e(TAG, "Initializing Dev & Sniffer Bypass for: " + lpparam.packageName);
 
         hookCrashSuppression();
         hookSettings(lpparam.classLoader);
         hookPackageManager(lpparam.classLoader);
-        hookNetworkCapabilities(lpparam.classLoader);
+        if (!"com.halcon.connect".equals(lpparam.packageName)) {
+            hookNetworkCapabilities(lpparam.classLoader);
+        }
         hookRootFiles(lpparam.classLoader);
 
         if ("com.halcon.connect".equals(lpparam.packageName)) {
@@ -99,6 +115,14 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             wrapDefaultExceptionHandler();
 
+            XposedHelpers.findAndHookMethod(Thread.class, "getUncaughtExceptionHandler", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    final Thread.UncaughtExceptionHandler original = (Thread.UncaughtExceptionHandler) param.getResult();
+                    param.setResult(createSafeHandler(original));
+                }
+            });
+
             XposedHelpers.findAndHookMethod(Thread.class, "setDefaultUncaughtExceptionHandler", Thread.UncaughtExceptionHandler.class, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
@@ -107,8 +131,39 @@ public class MainHook implements IXposedHookLoadPackage {
                     param.args[0] = createSafeHandler(orig);
                 }
             });
+
+            XposedHelpers.findAndHookMethod(Thread.class, "setUncaughtExceptionHandler", Thread.UncaughtExceptionHandler.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    final Thread.UncaughtExceptionHandler orig = (Thread.UncaughtExceptionHandler) param.args[0];
+                    if (orig == null) return;
+                    param.args[0] = createSafeHandler(orig);
+                }
+            });
+
+            XposedHelpers.findAndHookMethod(Process.class, "killProcess", int.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    int pid = ((Integer) param.args[0]).intValue();
+                    if (pid == Process.myPid() && sSuppressedCrashRecently) {
+                        Log.e(TAG, "Blocked Process.killProcess triggered by suppressed crash");
+                        param.setResult(null);
+                    }
+                }
+            });
+
+            XposedHelpers.findAndHookMethod(System.class, "exit", int.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    if (sSuppressedCrashRecently) {
+                        Log.e(TAG, "Blocked System.exit triggered by suppressed crash");
+                        param.setResult(null);
+                    }
+                }
+            });
+
         } catch (Throwable t) {
-            XposedBridge.log("[bywZero] hookCrashSuppression error: " + t.getMessage());
+            Log.e(TAG, "hookCrashSuppression error: " + t.getMessage());
         }
     }
 
@@ -124,7 +179,8 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             public void uncaughtException(Thread t, Throwable e) {
                 if (shouldSuppress(t, e)) {
-                    XposedBridge.log("[bywZero] Suppressed DexGuard crash on [" + t.getName() + "]: " + e.getClass().getName() + " - " + e.getMessage());
+                    sSuppressedCrashRecently = true;
+                    Log.e(TAG, "SUPPRESSED CRASH via Handler on [" + (t != null ? t.getName() : "null") + "]: " + e);
                     return;
                 }
                 if (original != null) {
@@ -139,15 +195,21 @@ public class MainHook implements IXposedHookLoadPackage {
         if (e instanceof ArithmeticException) {
             return true;
         }
+        if (e instanceof UnsatisfiedLinkError) {
+            String msg = e.getMessage();
+            if (msg != null && (msg.contains("forcedark") || msg.contains("libforcedarkimpl.so"))) {
+                return true;
+            }
+        }
         String msg = e.getMessage();
-        if (msg != null && (msg.contains("divide by zero") || msg.contains("/ by zero"))) {
+        if (msg != null && (msg.contains("divide by zero") || msg.contains("/ by zero") || msg.contains("zero") || msg.contains("1461490835"))) {
             return true;
         }
         StackTraceElement[] traces = e.getStackTrace();
         if (traces != null) {
             for (StackTraceElement ste : traces) {
                 String cls = ste.getClassName();
-                if (cls.startsWith("o.oood") || cls.startsWith("o.rrr") || cls.contains("behaviosec") || cls.contains("threatmetrix")) {
+                if (cls.startsWith("o.oood") || cls.startsWith("o.rrr") || cls.contains("behaviosec") || cls.contains("threatmetrix") || cls.contains("InitProvider") || cls.contains("ForceDark")) {
                     return true;
                 }
             }
@@ -201,7 +263,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 XposedHelpers.findAndHookMethod(secureClass, "getInt", ContentResolver.class, String.class, secureIntHook);
             }
         } catch (Throwable t) {
-            XposedBridge.log("[bywZero] hookSettings error: " + t.getMessage());
+            Log.e(TAG, "hookSettings error: " + t.getMessage());
         }
     }
 
@@ -269,8 +331,60 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
 
+            Class<?> amClass = XposedHelpers.findClassIfExists("android.app.ActivityManager", classLoader);
+            if (amClass != null) {
+                try {
+                    XposedHelpers.findAndHookMethod(amClass, "getRunningAppProcesses", new XC_MethodHook() {
+                        @Override
+                        @SuppressWarnings("unchecked")
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            List<ActivityManager.RunningAppProcessInfo> list = (List<ActivityManager.RunningAppProcessInfo>) param.getResult();
+                            if (list != null) {
+                                List<ActivityManager.RunningAppProcessInfo> filtered = new ArrayList<ActivityManager.RunningAppProcessInfo>();
+                                for (ActivityManager.RunningAppProcessInfo info : list) {
+                                    if (info != null && info.processName != null && !BLOCKED_PACKAGES.contains(info.processName)) {
+                                        boolean blocked = false;
+                                        if (info.pkgList != null) {
+                                            for (String p : info.pkgList) {
+                                                if (BLOCKED_PACKAGES.contains(p)) {
+                                                    blocked = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (!blocked) {
+                                            filtered.add(info);
+                                        }
+                                    }
+                                }
+                                param.setResult(filtered);
+                            }
+                        }
+                    });
+                } catch (Throwable ignored) {}
+
+                try {
+                    XposedHelpers.findAndHookMethod(amClass, "getRunningServices", int.class, new XC_MethodHook() {
+                        @Override
+                        @SuppressWarnings("unchecked")
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            List<ActivityManager.RunningServiceInfo> list = (List<ActivityManager.RunningServiceInfo>) param.getResult();
+                            if (list != null) {
+                                List<ActivityManager.RunningServiceInfo> filtered = new ArrayList<ActivityManager.RunningServiceInfo>();
+                                for (ActivityManager.RunningServiceInfo s : list) {
+                                    if (s != null && s.service != null && !BLOCKED_PACKAGES.contains(s.service.getPackageName()) && !BLOCKED_PACKAGES.contains(s.process)) {
+                                        filtered.add(s);
+                                    }
+                                }
+                                param.setResult(filtered);
+                            }
+                        }
+                    });
+                } catch (Throwable ignored) {}
+            }
+
         } catch (Throwable t) {
-            XposedBridge.log("[bywZero] hookPackageManager error: " + t.getMessage());
+            Log.e(TAG, "hookPackageManager error: " + t.getMessage());
         }
     }
 
@@ -289,58 +403,249 @@ public class MainHook implements IXposedHookLoadPackage {
                 });
             }
         } catch (Throwable t) {
-            XposedBridge.log("[bywZero] hookNetworkCapabilities error: " + t.getMessage());
+            Log.e(TAG, "hookNetworkCapabilities error: " + t.getMessage());
         }
+    }
+
+    private static boolean isRootPath(String path) {
+        if (path == null) return false;
+        if (ROOT_FILES.contains(path)) return true;
+        if (path.contains("/su") || path.endsWith("/su") || path.contains("magisk") || path.contains("kernelsu") || path.contains("ksud")) {
+            return true;
+        }
+        if (path.startsWith("/data/adb/") && !path.startsWith("/data/adb/service.d")) {
+            return true;
+        }
+        return false;
     }
 
     private void hookRootFiles(ClassLoader classLoader) {
         try {
-            XposedHelpers.findAndHookMethod(File.class, "exists", new XC_MethodHook() {
+            XC_MethodHook fileHook = new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                     File file = (File) param.thisObject;
                     if (file != null) {
                         String path = file.getAbsolutePath();
-                        if (ROOT_FILES.contains(path) || (path.startsWith("/data/adb/") && !path.startsWith("/data/adb/service.d"))) {
+                        if (isRootPath(path)) {
                             param.setResult(Boolean.FALSE);
                         }
                     }
                 }
-            });
+            };
+
+            XposedHelpers.findAndHookMethod(File.class, "exists", fileHook);
+            try {
+                XposedHelpers.findAndHookMethod(File.class, "canExecute", fileHook);
+                XposedHelpers.findAndHookMethod(File.class, "canRead", fileHook);
+            } catch (Throwable ignored) {}
+
+            // Hook Runtime.exec and ProcessBuilder to block command-based root checks
+            XC_MethodHook execHook = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    Object cmdObj = param.args[0];
+                    String cmd = "";
+                    if (cmdObj instanceof String) {
+                        cmd = (String) cmdObj;
+                    } else if (cmdObj instanceof String[]) {
+                        cmd = Arrays.toString((String[]) cmdObj);
+                    }
+                    if (cmd.contains("su") || cmd.contains("which") || cmd.contains("busybox")) {
+                        Log.e(TAG, "Blocked exec command: " + cmd);
+                        param.setThrowable(new IOException("Command not found: " + cmd));
+                    }
+                }
+            };
+
+            try {
+                XposedHelpers.findAndHookMethod(Runtime.class, "exec", String.class, execHook);
+                XposedHelpers.findAndHookMethod(Runtime.class, "exec", String[].class, execHook);
+                XposedHelpers.findAndHookMethod(Runtime.class, "exec", String.class, String[].class, File.class, execHook);
+                XposedHelpers.findAndHookMethod(Runtime.class, "exec", String[].class, String[].class, File.class, execHook);
+            } catch (Throwable ignored) {}
+
+            try {
+                XposedHelpers.findAndHookMethod(ProcessBuilder.class, "start", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        ProcessBuilder pb = (ProcessBuilder) param.thisObject;
+                        List<String> command = pb.command();
+                        if (command != null) {
+                            for (String c : command) {
+                                if (c != null && (c.contains("su") || c.contains("which") || c.contains("busybox"))) {
+                                    Log.e(TAG, "Blocked ProcessBuilder command: " + command);
+                                    param.setThrowable(new IOException("Command not found: " + command));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            } catch (Throwable ignored) {}
+
+            try {
+                Field tagsField = android.os.Build.class.getDeclaredField("TAGS");
+                tagsField.setAccessible(true);
+                tagsField.set(null, "release-keys");
+            } catch (Throwable ignored) {}
+
         } catch (Throwable t) {
-            XposedBridge.log("[bywZero] hookRootFiles error: " + t.getMessage());
+            Log.e(TAG, "hookRootFiles error: " + t.getMessage());
         }
     }
 
-    private void hookHalconConnect(ClassLoader classLoader) {
+    private void hookNativeSecurityMethods(Class<?> secClass) {
         try {
+            for (Method m : secClass.getDeclaredMethods()) {
+                if (m.getName().equals("checkSecurity")) {
+                    XposedBridge.hookMethod(m, XC_MethodReplacement.returnConstant(Integer.valueOf(0)));
+                    Log.e(TAG, "Hooked NativeSecurity.checkSecurity -> 0");
+                }
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "hookNativeSecurityMethods error: " + t.getMessage());
+        }
+    }
+
+    private void hookHalconConnect(final ClassLoader classLoader) {
+        try {
+            // 1. Hook NativeSecurity.checkSecurity directly
             Class<?> secClass = XposedHelpers.findClassIfExists("halcon.vip.vpn.util.NativeSecurity", classLoader);
             if (secClass != null) {
-                XposedHelpers.findAndHookMethod(secClass, "checkSecurity", Context.class, XC_MethodReplacement.returnConstant(Integer.valueOf(0)));
-                XposedBridge.log("[bywZero] Hooked halcon NativeSecurity.checkSecurity -> 0");
+                hookNativeSecurityMethods(secClass);
             }
 
+            // 3. Hook v3.b.m (security alert dialog trigger) -> return true
             Class<?> bClass = XposedHelpers.findClassIfExists("v3.b", classLoader);
             if (bClass != null) {
-                XposedHelpers.findAndHookMethod(bClass, "m", Context.class, XC_MethodReplacement.returnConstant(Boolean.TRUE));
-                XposedBridge.log("[bywZero] Hooked halcon v3.b.m -> true");
+                for (Method m : bClass.getDeclaredMethods()) {
+                    if (m.getName().equals("m") && m.getReturnType() == boolean.class) {
+                        XposedBridge.hookMethod(m, XC_MethodReplacement.returnConstant(Boolean.TRUE));
+                        Log.e(TAG, "Hooked halcon v3.b.m -> true");
+                    }
+                }
             }
+
+            // 4. Hook m4.t.n (background termination check) -> DO_NOTHING
+            Class<?> tClass = XposedHelpers.findClassIfExists("m4.t", classLoader);
+            if (tClass != null) {
+                for (Method m : tClass.getDeclaredMethods()) {
+                    if (m.getName().equals("n")) {
+                        XposedBridge.hookMethod(m, XC_MethodReplacement.DO_NOTHING);
+                        Log.e(TAG, "Hooked halcon m4.t.n -> DO_NOTHING");
+                    }
+                }
+            }
+
+            // 5. Block Process.killProcess and System.exit within Halcon
+            XposedHelpers.findAndHookMethod(Process.class, "killProcess", int.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    int pid = ((Integer) param.args[0]).intValue();
+                    if (pid == Process.myPid()) {
+                        Log.e(TAG, "Halcon: Blocked Process.killProcess(myPid)");
+                        param.setResult(null);
+                    }
+                }
+            });
+
+            XposedHelpers.findAndHookMethod(System.class, "exit", int.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    Log.e(TAG, "Halcon: Blocked System.exit(" + param.args[0] + ")");
+                    param.setResult(null);
+                }
+            });
+
         } catch (Throwable t) {
-            XposedBridge.log("[bywZero] hookHalconConnect error: " + t.getMessage());
+            Log.e(TAG, "hookHalconConnect error: " + t.getMessage());
         }
     }
 
-    private void hookCfeContigo(ClassLoader classLoader) {
+    private void hookCfeContigo(final ClassLoader classLoader) {
         try {
             Class<?> sClass = XposedHelpers.findClassIfExists("o.s00730073s00730073s", classLoader);
             if (sClass != null) {
                 XposedHelpers.findAndHookMethod(sClass, "MediaBrowserCompatCustomActionResultReceiver", XC_MethodReplacement.returnConstant(Boolean.TRUE));
-                XposedBridge.log("[bywZero] Hooked CFE s00730073s00730073s.MediaBrowserCompatCustomActionResultReceiver -> true");
+                Log.e(TAG, "Hooked CFE s00730073s00730073s.MediaBrowserCompatCustomActionResultReceiver -> true");
             } else {
-                XposedBridge.log("[bywZero] CFE class o.s00730073s00730073s not found!");
+                Log.e(TAG, "CFE class o.s00730073s00730073s not found!");
             }
+
+            // 1. Huawei AAID InitProvider
+            Class<?> initProvClass = XposedHelpers.findClassIfExists("com.huawei.hms.aaid.InitProvider", classLoader);
+            if (initProvClass != null) {
+                XposedHelpers.findAndHookMethod(initProvClass, "onCreate", XC_MethodReplacement.returnConstant(Boolean.TRUE));
+                Log.e(TAG, "Hooked CFE com.huawei.hms.aaid.InitProvider.onCreate -> true");
+            }
+
+            // 2. Firebase InitProvider
+            Class<?> fbClass = XposedHelpers.findClassIfExists("com.google.firebase.provider.FirebaseInitProvider", classLoader);
+            if (fbClass != null) {
+                XposedHelpers.findAndHookMethod(fbClass, "onCreate", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        try {
+                            if (param.thisObject instanceof android.content.ContentProvider) {
+                                Context ctx = ((android.content.ContentProvider) param.thisObject).getContext();
+                                Class<?> fbApp = XposedHelpers.findClassIfExists("com.google.firebase.FirebaseApp", classLoader);
+                                if (fbApp != null && ctx != null) {
+                                    Method m = fbApp.getMethod("initializeApp", Context.class);
+                                    m.invoke(null, ctx);
+                                    Log.e(TAG, "Manually initialized FirebaseApp via reflection");
+                                }
+                            }
+                        } catch (Throwable t) {
+                            Log.e(TAG, "FirebaseApp.initializeApp error: " + t.getMessage());
+                        }
+                        param.setResult(Boolean.FALSE);
+                    }
+                });
+                Log.e(TAG, "Hooked CFE FirebaseInitProvider.onCreate -> bypass DexGuard");
+            }
+
+            // 3. Huawei AGConnect InitializeProvider
+            Class<?> agcProvClass = XposedHelpers.findClassIfExists("com.huawei.agconnect.core.provider.AGConnectInitializeProvider", classLoader);
+            if (agcProvClass != null) {
+                XposedHelpers.findAndHookMethod(agcProvClass, "onCreate", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        try {
+                            if (param.thisObject instanceof android.content.ContentProvider) {
+                                Context ctx = ((android.content.ContentProvider) param.thisObject).getContext();
+                                Class<?> agc = XposedHelpers.findClassIfExists("com.huawei.agconnect.AGConnectInstance", classLoader);
+                                if (agc != null && ctx != null) {
+                                    Method m = agc.getMethod("initialize", Context.class);
+                                    m.invoke(null, ctx);
+                                    Log.e(TAG, "Manually initialized AGConnectInstance via reflection");
+                                }
+                            }
+                        } catch (Throwable t) {
+                            Log.e(TAG, "AGConnectInstance.initialize error: " + t.getMessage());
+                        }
+                        param.setResult(Boolean.FALSE);
+                    }
+                });
+                Log.e(TAG, "Hooked CFE AGConnectInitializeProvider.onCreate -> bypass DexGuard");
+            }
+
+            // 4. Huawei Push Provider
+            Class<?> pushProvClass = XposedHelpers.findClassIfExists("com.huawei.hms.support.api.push.PushProvider", classLoader);
+            if (pushProvClass != null) {
+                XposedHelpers.findAndHookMethod(pushProvClass, "onCreate", XC_MethodReplacement.returnConstant(Boolean.TRUE));
+                Log.e(TAG, "Hooked CFE PushProvider.onCreate -> true");
+            }
+
+            // 5. AndroidX FileProvider
+            Class<?> fileProvClass = XposedHelpers.findClassIfExists("androidx.core.content.FileProvider", classLoader);
+            if (fileProvClass != null) {
+                XposedHelpers.findAndHookMethod(fileProvClass, "onCreate", XC_MethodReplacement.returnConstant(Boolean.TRUE));
+                Log.e(TAG, "Hooked CFE FileProvider.onCreate -> true");
+            }
+
         } catch (Throwable t) {
-            XposedBridge.log("[bywZero] hookCfeContigo error: " + t.getMessage());
+            Log.e(TAG, "hookCfeContigo error: " + t.getMessage());
         }
     }
 }
